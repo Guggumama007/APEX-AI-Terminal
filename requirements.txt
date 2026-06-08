@@ -1,22 +1,29 @@
+# Lower bounds are the versions APEX is currently developed/tested against.
+# Pinning with >= prevents silent breakage from incompatible future releases
+# while still allowing compatible upgrades.
+
 # ── GUI & Charting ──
-PyQt6
-matplotlib
+PyQt6>=6.11.0
+matplotlib>=3.10.9
 
 # ── Data & Math Core ──
-pandas
-numpy
+pandas>=3.0.3
+numpy>=2.4.6
 
 # ── Market Data & News ──
-yfinance
-feedparser
+yfinance>=1.4.1
+feedparser>=6.0.12
 
 # ── API & Document Parsing ──
-requests
-pdfplumber
+requests>=2.34.2
+pdfplumber>=0.11.9
 
 # ── Advanced Quants & Machine Learning ──
-xgboost
-scikit-learn
-statsmodels
-hmmlearn
-vmdpy
+xgboost>=3.2.0
+scikit-learn>=1.9.0
+statsmodels>=0.14.6
+hmmlearn>=0.3.3
+vmdpy>=0.2
+
+# ── Optional (enable extra models if installed) ──
+# arch>=7.0   # GARCH volatility modelling (HAS_GARCH)
