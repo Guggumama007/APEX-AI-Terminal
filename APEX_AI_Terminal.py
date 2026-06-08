@@ -836,11 +836,15 @@ class DataEngine:
 
     _CACHE_TTL  = 300   # seconds a cached frame stays fresh
     _CACHE_MAX  = 128   # hard cap on cached entries to bound memory
+    _INFO_TTL   = 900   # ticker .info changes slowly — cache 15 min
+    _QUOTE_TTL  = 60    # quotes must stay fresh — cache 1 min only
 
     def __init__(self):
         self._cache = {}
-        # Many QThreads (FetchThread, WatchlistThread, StreamThread, ...) hit this
-        # cache concurrently. Guard all access with a lock to avoid races.
+        self._info_cache  = {}   # ticker -> (ts, info dict)
+        self._quote_cache = {}   # ticker -> (ts, (price, pct))
+        # Many QThreads (FetchThread, WatchlistThread, StreamThread, ...) hit these
+        # caches concurrently. Guard all access with a lock to avoid races.
         self._cache_lock = threading.Lock()
 
     def fetch(self, ticker, period='1y', interval='1d'):
@@ -880,13 +884,24 @@ class DataEngine:
                 del self._cache[k]
 
     def info(self, ticker):
+        with self._cache_lock:
+            cached = self._info_cache.get(ticker)
+            if cached is not None and time.time() - cached[0] < self._INFO_TTL:
+                return cached[1]
         try:
-            return yf.Ticker(ticker).info
+            data = yf.Ticker(ticker).info
         except Exception:
             return {}
+        with self._cache_lock:
+            self._info_cache[ticker] = (time.time(), data)
+        return data
 
     def fast_quote(self, ticker):
         """Ultra-resilient price fetcher that bypasses Yahoo's Info blocks."""
+        with self._cache_lock:
+            cached = self._quote_cache.get(ticker)
+            if cached is not None and time.time() - cached[0] < self._QUOTE_TTL:
+                return cached[1]
         try:
             import yfinance as yf
             # Use history (chart data) because Yahoo does not block it.
@@ -897,8 +912,12 @@ class DataEngine:
                 if len(df) >= 2:
                     prev = float(df['Close'].iloc[-2])
                     pct = ((curr - prev) / prev * 100) if prev > 0 else 0.0
-                    return curr, pct
-                return curr, 0.0
+                    result = (curr, pct)
+                else:
+                    result = (curr, 0.0)
+                with self._cache_lock:
+                    self._quote_cache[ticker] = (time.time(), result)
+                return result
         except Exception:
             pass
         return None, None
