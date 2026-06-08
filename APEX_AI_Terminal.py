@@ -24,7 +24,7 @@ REQUIREMENTS:
 # ═══════════════════════════════════════════════════════════════════════════════
 # IMPORTS
 # ═══════════════════════════════════════════════════════════════════════════════
-import sys, os, json, threading, time, datetime, re, traceback
+import sys, os, json, threading, time, datetime, re, traceback, logging
 import requests
 import pandas as pd
 import numpy as np
@@ -148,6 +148,28 @@ VER      = "v1.0"
 # can target LM Studio (default), Ollama (http://localhost:11434), or any other
 # OpenAI-compatible server without editing source.
 LM_URL   = os.environ.get("APEX_LM_URL", "http://localhost:1234")
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# Diagnostics go through a module logger instead of bare print() so users can
+# raise/lower verbosity (APEX_LOG_LEVEL) and capture to a file (APEX_LOG_FILE)
+# without editing source. Defaults keep console output identical in spirit.
+def _setup_logging():
+    level = getattr(logging, os.environ.get("APEX_LOG_LEVEL", "INFO").upper(), logging.INFO)
+    handlers = [logging.StreamHandler()]
+    log_file = os.environ.get("APEX_LOG_FILE")
+    if log_file:
+        try:
+            handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        except Exception:
+            pass
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
+    )
+    return logging.getLogger("apex")
+
+log = _setup_logging()
 
 WATCHLIST_DEFAULT = [
     "AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA",
@@ -867,7 +889,7 @@ class DataEngine:
                 self._evict_locked()
             return df
         except Exception as exc:
-            print(f"DataEngine.fetch error [{ticker}]: {exc}")
+            log.warning("DataEngine.fetch error [%s]: %s", ticker, exc)
             return None
 
     def _evict_locked(self):
@@ -958,7 +980,7 @@ class DataEngine:
             d['Kalman'] = kf_mean
             d['Kalman_Diff'] = (d['Close'] - d['Kalman']) / d['Kalman'] * 100
         except Exception as e:
-            print(f"Kalman Error: {e}")
+            log.warning("Kalman Error: %s", e)
             d['Kalman'] = np.nan
             d['Kalman_Diff'] = 0.0
 
@@ -1161,7 +1183,7 @@ class DataEngine:
             d['EMA9'] = ema9
             d['EMA21'] = ema21
         except Exception as e:
-            print(f"PTT Engine Error: {e}")
+            log.warning("PTT Engine Error: %s", e)
 
                 # ── VWAP Deviation Bands ─────────────────────────────────────────
         try:
@@ -1323,7 +1345,7 @@ class DataEngine:
             d['ML_ST_Conf'] = conf_scores
             
         except Exception as e:
-            print(f"ML SuperTrend Error: {e}")
+            log.warning("ML SuperTrend Error: %s", e)
 
             
         # ── LORENTZIAN PROBABILITY DETECTOR (KNN) ─────────────────────────
@@ -1413,7 +1435,7 @@ class DataEngine:
             d['Lor_Pred'] = lor_pred
             
         except Exception as e:
-            print(f"Lorentzian KNN Error: {e}")
+            log.warning("Lorentzian KNN Error: %s", e)
 
 
         # ── TITAN FLOW MATRIX™ (MULTI-FACTOR CONFLUENCE ENGINE) ───────
@@ -1472,7 +1494,7 @@ class DataEngine:
 
             d['Titan_Signal'] =[get_titan_signal(v) for v in d['Titan_Score']]
         except Exception as e:
-            print(f"TITAN Matrix Error: {e}")
+            log.warning("TITAN Matrix Error: %s", e)
 
             
         # ── MATHEMATICAL CANDLESTICK PATTERN SCANNER ─────────────────
@@ -1616,7 +1638,7 @@ class DataEngine:
 
             d.attrs['oetb_state'] = oetb_state
         except Exception as e:
-            print(f"OETB Error: {e}")
+            log.warning("OETB Error: %s", e)
 
         # ── INSIDER TRADING OVERLAY PREP ──────────────────────────────
         try:
@@ -1671,7 +1693,7 @@ class DataEngine:
                                     # Stack the money on top of each other!
                                     d.iloc[match_idx, d.columns.get_loc('Ins_Value')] += val
         except Exception as e:
-            print(f"Insider Chart Overlay Error: {e}")
+            log.warning("Insider Chart Overlay Error: %s", e)
 
             
         return d
@@ -1833,7 +1855,7 @@ class DataEngine:
             self._cache[key] = (time.time(), result)
             return result
         except Exception as e:
-            print(f"Max Pain calculation error: {e}")
+            log.warning("Max Pain calculation error: %s", e)
             return None
 
     def advanced_signals(self, df, ticker, period='1y'):
@@ -2273,7 +2295,7 @@ class DataEngine:
                 'target_30d': future_path[-1]
             }
         except Exception as e:
-            print(f"FFT Error: {e}")
+            log.warning("FFT Error: %s", e)
             return None
 
     def vmd_extrapolation(self, df, horizon=30):
@@ -2332,7 +2354,7 @@ class DataEngine:
                 'target_30d': future_path[-1]
             }
         except Exception as e:
-            print(f"VMD Error: {e}")
+            log.warning("VMD Error: %s", e)
             return None
 
     def svr_extrapolation(self, df, horizon=30, window=10):
@@ -2384,7 +2406,7 @@ class DataEngine:
                 'target_30d': future_preds[-1]
             }
         except Exception as e:
-            print(f"SVR Error: {e}")
+            log.warning("SVR Error: %s", e)
             return None
 
 DE = DataEngine()
