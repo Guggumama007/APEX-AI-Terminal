@@ -6047,10 +6047,78 @@ class AnalysisPanel(QWidget):
             return False
         return True
 
+    def _live_context(self, t):
+        """Build an authoritative live-data snapshot so the LLM anchors its
+        report to TODAY'S real price/fundamentals instead of stale training
+        memory. Returns (text_block, current_price_or_None, currency)."""
+        try:
+            info = DE.info(t) or {}
+        except Exception:
+            info = {}
+        price, _ = DE.fast_quote(t)
+        if price is None:
+            price = info.get('currentPrice') or info.get('regularMarketPrice')
+        cur = info.get('currency', '') or ''
+
+        def g(k):
+            v = info.get(k)
+            return v if isinstance(v, (int, float)) else None
+
+        lines = []
+        if isinstance(price, (int, float)):
+            lines.append(f"- Current price: {price:.4f} {cur}".rstrip())
+        else:
+            lines.append("- Current price: n/d")
+        mc = g('marketCap')
+        if mc:
+            lines.append(f"- Market cap: {mc:,.0f} {cur}".rstrip())
+        for label, key, pct in [
+            ("Trailing P/E", "trailingPE", False), ("Forward P/E", "forwardPE", False),
+            ("EV/EBITDA", "enterpriseToEbitda", False), ("Price/Book", "priceToBook", False),
+            ("Revenue growth", "revenueGrowth", True), ("Gross margin", "grossMargins", True),
+            ("Net margin", "profitMargins", True), ("Beta", "beta", False),
+            ("Dividend yield", "dividendYield", True),
+        ]:
+            v = g(key)
+            if v is not None:
+                lines.append(f"- {label}: {v*100:.1f}%" if pct else f"- {label}: {v:.2f}")
+        hi = g('fiftyTwoWeekHigh'); lo = g('fiftyTwoWeekLow')
+        if hi is not None and lo is not None:
+            lines.append(f"- 52-week range: {lo:.2f} – {hi:.2f} {cur}".rstrip())
+        sector = info.get('sector'); industry = info.get('industry')
+        if sector:
+            lines.append(f"- Sector: {sector}" + (f" / {industry}" if industry else ""))
+        price_val = price if isinstance(price, (int, float)) else None
+        return "\n".join(lines), price_val, cur
+
+    @staticmethod
+    def _live_guard(price, cur):
+        """Strict instruction forcing the model to use live data, not memory."""
+        if price is not None:
+            anchor = (f"The CURRENT market price is {price:.4f} {cur}".rstrip()
+                      + ". Use THIS exact figure. ")
+        else:
+            anchor = "The live price could not be fetched; state that explicitly and do NOT invent one. "
+        return (
+            "\n\nCRITICAL — DATA INTEGRITY RULES:\n"
+            f"{anchor}"
+            "Do NOT use any price you remember from training; it is outdated. "
+            "Quote all prices and the price target in the security's own currency "
+            f"({cur or 'native currency'}), not US dollars unless that is the listing currency. "
+            "Compute 'Implied Upside' strictly as (Price Target / Current Price - 1). "
+            "Your price target, bull/base/bear levels, and multiples must be internally "
+            "consistent with the current price and fundamentals shown above."
+        )
+
     def _run_full(self):
         if not self._check(): return
         t = self.ticker
+        _ctx, _price, _cur = self._live_context(t)
         prompt = f"""Write a FULL professional equity research initiation report for {t}.
+
+[LIVE MARKET DATA — AUTHORITATIVE, fetched today]
+{_ctx}
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {t} | EQUITY RESEARCH | INITIATION OF COVERAGE
@@ -6099,12 +6167,16 @@ Upcoming events that could move the stock (dates if known).
 [CONCLUSION]
 Restate rating, price target, and conviction with one-line rationale.
 
-Be specific. Use real numbers. No filler."""
+Be specific. Use real numbers. No filler.""" + self._live_guard(_price, _cur)
         self._stream(prompt)
 
     def _run_dcf(self):
         if not self._check(): return
+        _ctx, _price, _cur = self._live_context(self.ticker)
         self._stream(f"""Build a detailed DCF valuation model for {self.ticker}.
+
+[LIVE MARKET DATA — AUTHORITATIVE, fetched today]
+{_ctx}
 
 [MODEL ASSUMPTIONS]
 Revenue base year, growth rates (Year 1-5, terminal), EBIT margins, D&A, capex, NWC.
@@ -6125,11 +6197,15 @@ Grid: WACC (rows: -1%, base, +1%, +2%) vs Terminal Growth Rate (cols: 1%, 2%, 3%
 Show implied share prices in each cell.
 
 [CONCLUSION]
-Intrinsic value range (bear/base/bull), comparison to current price.""")
+Intrinsic value range (bear/base/bull), comparison to current price.""" + self._live_guard(_price, _cur))
 
     def _run_comps(self):
         if not self._check(): return
+        _ctx, _price, _cur = self._live_context(self.ticker)
         self._stream(f"""Create a full comparable company analysis for {self.ticker}.
+
+[LIVE MARKET DATA — AUTHORITATIVE, fetched today]
+{_ctx}
 
 [PEER SELECTION]
 Name 6-8 closest peers and explain selection rationale.
@@ -6148,7 +6224,7 @@ Premium/discount and why it is or is not justified.
 Using median peer multiples, derive a valuation range for {self.ticker}.
 
 [CONCLUSION]
-Is {self.ticker} cheap or expensive vs peers? Final take.""")
+Is {self.ticker} cheap or expensive vs peers? Final take.""" + self._live_guard(_price, _cur))
 
     def _run_earnings(self):
         if not self._check(): return
