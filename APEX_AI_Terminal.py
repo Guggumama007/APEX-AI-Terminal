@@ -144,10 +144,6 @@ else:  # PySide2
 # ═══════════════════════════════════════════════════════════════════════════════
 APP      = "APEX AI TERMINAL"
 VER      = "v1.0"
-# LM endpoint is configurable via the APEX_LM_URL environment variable so the app
-# can target LM Studio (default), Ollama (http://localhost:11434), or any other
-# OpenAI-compatible server without editing source.
-LM_URL   = os.environ.get("APEX_LM_URL", "http://localhost:1234")
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # Diagnostics go through a module logger instead of bare print() so users can
@@ -170,6 +166,40 @@ def _setup_logging():
     return logging.getLogger("apex")
 
 log = _setup_logging()
+
+# ── Persistent config ────────────────────────────────────────────────────────
+# User settings (e.g. the LM server URL applied from the Settings tab) persist
+# in ~/.apex/config.json so they survive restarts without env vars.
+CONFIG_DIR  = os.path.join(os.path.expanduser("~"), ".apex")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_config(updates):
+    """Merge updates into the on-disk config. Returns True on success."""
+    cfg = load_config()
+    cfg.update(updates)
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        return True
+    except Exception as exc:
+        log.warning("Could not save config to %s: %s", CONFIG_PATH, exc)
+        return False
+
+CONFIG = load_config()
+
+# LM endpoint resolution order: APEX_LM_URL env var (explicit runtime override)
+# → persisted config (Settings tab) → built-in default. Targets LM Studio by
+# default; point at Ollama (http://localhost:11434) or any OpenAI-compatible
+# server via env var or the Settings tab.
+LM_URL = os.environ.get("APEX_LM_URL") or CONFIG.get("lm_url") or "http://localhost:1234"
 
 WATCHLIST_DEFAULT = [
     "AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA",
@@ -8182,10 +8212,12 @@ class SettingsPanel(QWidget):
 
     def _save(self):
         # Apply the server URL the user typed (previously this button did nothing —
-        # only "Test Connection" updated LM.base).
+        # only "Test Connection" updated LM.base) and persist it so it survives
+        # restarts.
         new_url = self.url_inp.text().strip()
         if new_url:
             LM.base = new_url
+            save_config({"lm_url": new_url})
         LM.check()
         BUS.status_msg.emit("Settings applied")
 
