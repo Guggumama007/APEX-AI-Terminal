@@ -8735,6 +8735,361 @@ class AITraderPanel(QWidget):
         self.val_ret.setStyleSheet(f"color:{color}; font-size:18px; font-weight:bold;")
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PORTFOLIO — generic personal portfolio (manual entry or CSV/JSON import)
+# ═══════════════════════════════════════════════════════════════════════════════
+def aggregate_positions(transactions):
+    """Collapse a list of BUY/SELL transactions into net positions.
+    Returns [{symbol, qty, avg_cost}], skipping fully-closed positions.
+    avg_cost is the quantity-weighted average of BUY prices only."""
+    agg = {}
+    for t in transactions or []:
+        sym = str(t.get('symbol', '')).strip()
+        if not sym:
+            continue
+        typ = str(t.get('type', 'BUY')).strip().upper()
+        try:
+            qty   = float(t.get('quantity', 0))
+            price = float(t.get('price', 0))
+        except (TypeError, ValueError):
+            continue
+        a = agg.setdefault(sym, {'symbol': sym, 'qty': 0.0, 'buy_cost': 0.0, 'buy_qty': 0.0})
+        if typ == 'SELL':
+            a['qty'] -= qty
+        else:
+            a['qty']      += qty
+            a['buy_cost'] += qty * price
+            a['buy_qty']  += qty
+    out = []
+    for sym, a in agg.items():
+        if abs(a['qty']) < 1e-9:
+            continue
+        avg = (a['buy_cost'] / a['buy_qty']) if a['buy_qty'] > 0 else 0.0
+        out.append({'symbol': sym, 'qty': a['qty'], 'avg_cost': avg})
+    return out
+
+
+def parse_portfolio_file(path):
+    """Parse a portfolio from .json (Fincept schema) or .csv.
+    Raises ValueError with a human-readable message on bad input."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.json':
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            data = {'transactions': data}
+        if not isinstance(data, dict):
+            raise ValueError("JSON non valido: atteso un oggetto con 'transactions'.")
+        data.setdefault('portfolio_name', os.path.basename(path))
+        data.setdefault('currency', '')
+        data.setdefault('owner', '')
+        data.setdefault('transactions', [])
+        return data
+    if ext == '.csv':
+        df = pd.read_csv(path)
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        required = {'date', 'symbol', 'type', 'quantity', 'price'}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError("Al CSV mancano le colonne: " + ", ".join(sorted(missing)))
+        txns = []
+        for _, r in df.iterrows():
+            try:
+                txns.append({
+                    'date':     str(r['date']),
+                    'symbol':   str(r['symbol']).strip(),
+                    'type':     str(r['type']).strip().upper(),
+                    'quantity': float(r['quantity']),
+                    'price':    float(r['price']),
+                })
+            except (TypeError, ValueError):
+                continue
+        return {'portfolio_name': os.path.basename(path), 'currency': '', 'owner': '', 'transactions': txns}
+    raise ValueError("Formato non supportato. Usa un file .json o .csv.")
+
+
+def write_portfolio_template(directory):
+    """Write portfolio_template.json and .csv into directory. Returns (json_path, csv_path)."""
+    sample = {
+        "portfolio_name": "Il mio portfolio",
+        "currency": "EUR",
+        "owner": "",
+        "transactions": [
+            {"date": "2025-01-15", "symbol": "AAPL",  "type": "BUY", "quantity": 10, "price": 185.50},
+            {"date": "2025-03-02", "symbol": "MSFT",  "type": "BUY", "quantity": 5,  "price": 410.00},
+            {"date": "2025-04-10", "symbol": "WBD.MI", "type": "BUY", "quantity": 100, "price": 2.74},
+        ],
+    }
+    jpath = os.path.join(directory, "portfolio_template.json")
+    cpath = os.path.join(directory, "portfolio_template.csv")
+    with open(jpath, 'w', encoding='utf-8') as f:
+        json.dump(sample, f, indent=2, ensure_ascii=False)
+    with open(cpath, 'w', encoding='utf-8') as f:
+        f.write("date,symbol,type,quantity,price\n")
+        for t in sample["transactions"]:
+            f.write(f"{t['date']},{t['symbol']},{t['type']},{t['quantity']},{t['price']}\n")
+    return jpath, cpath
+
+
+class PortfolioPriceThread(QThread):
+    """Fetch live price + currency for each position off the GUI thread."""
+    done = pyqtSignal(list)
+
+    def __init__(self, positions):
+        super().__init__()
+        self.positions = positions
+
+    def run(self):
+        out = []
+        for p in self.positions:
+            sym = p['symbol']
+            price, pct = DE.fast_quote(sym)
+            currency = ''
+            if price is not None:
+                try:
+                    currency = (DE.info(sym) or {}).get('currency', '') or ''
+                except Exception:
+                    currency = ''
+            out.append({**p, 'price': price, 'pct': pct,
+                        'currency': currency, 'priced': price is not None})
+        self.done.emit(out)
+
+
+class PortfolioPanel(QWidget):
+    """Generic portfolio: import CSV/JSON or add holdings manually, value them
+    live (each in its own currency), and analyse with the local LLM."""
+    go_chart = pyqtSignal(str)   # emitted on row click → MainWindow switches to CHART
+
+    def __init__(self):
+        super().__init__()
+        self._price_thread = None
+        self._ai = None
+        # Load any persisted portfolio from ~/.apex/config.json
+        data = CONFIG.get('portfolio') if isinstance(CONFIG, dict) else None
+        self.data = data if isinstance(data, dict) else {
+            'portfolio_name': '', 'currency': '', 'owner': '', 'transactions': []
+        }
+        self.data.setdefault('transactions', [])
+        self._setup_ui()
+        self._refresh_table()
+
+    # ── UI ────────────────────────────────────────────────────────────────
+    def _setup_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        hdr = QLabel("◈  PORTFOLIO")
+        hdr.setStyleSheet(f"color:{C['accent']}; font-weight:bold; font-size:13px; letter-spacing:1px;")
+        lay.addWidget(hdr)
+
+        # Toolbar
+        tb = QHBoxLayout()
+        for text, slot in [
+            ("📂  Carica CSV/JSON", self._import),
+            ("📄  Scarica template", self._template),
+            ("🔄  Aggiorna prezzi", self._refresh_table),
+            ("🧠  Analisi AI",       self._ai_analyze),
+            ("🗑  Svuota",           self._clear),
+        ]:
+            b = QPushButton(text)
+            b.setFixedHeight(28)
+            b.clicked.connect(slot)
+            tb.addWidget(b)
+        tb.addStretch()
+        lay.addLayout(tb)
+
+        # Manual entry row
+        mrow = QHBoxLayout()
+        self.in_date = QLineEdit(); self.in_date.setPlaceholderText("YYYY-MM-DD")
+        self.in_date.setText(datetime.date.today().isoformat()); self.in_date.setFixedWidth(110)
+        self.in_sym  = QLineEdit(); self.in_sym.setPlaceholderText("Simbolo (es. AAPL)"); self.in_sym.setFixedWidth(140)
+        self.in_type = QComboBox(); self.in_type.addItems(["BUY", "SELL"]); self.in_type.setFixedWidth(80)
+        self.in_qty  = QLineEdit(); self.in_qty.setPlaceholderText("Quantità"); self.in_qty.setFixedWidth(90)
+        self.in_px   = QLineEdit(); self.in_px.setPlaceholderText("Prezzo"); self.in_px.setFixedWidth(90)
+        add_btn = QPushButton("➕  Aggiungi"); add_btn.setFixedHeight(26); add_btn.clicked.connect(self._add_manual)
+        for w in (QLabel("Aggiungi a mano:"), self.in_date, self.in_sym, self.in_type,
+                  self.in_qty, self.in_px, add_btn):
+            mrow.addWidget(w)
+        mrow.addStretch()
+        lay.addLayout(mrow)
+
+        # Positions table
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(
+            ["SIMBOLO", "QTÀ", "COSTO MEDIO", "ULTIMO", "VALORE", "P/L", "P/L %", "VALUTA"])
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, 8):
+            h.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.cellClicked.connect(self._row_clicked)
+        lay.addWidget(self.table, 1)
+
+        # Totals + empty-state line
+        self.totals_lbl = QLabel("")
+        self.totals_lbl.setStyleSheet(f"color:{C['text2']}; font-size:11px;")
+        self.totals_lbl.setWordWrap(True)
+        lay.addWidget(self.totals_lbl)
+
+        # AI analysis output
+        self.ai_view = QTextBrowser()
+        self.ai_view.setOpenExternalLinks(True)
+        self.ai_view.setPlaceholderText("Premi 'Analisi AI' per un commento del modello locale sul portfolio…")
+        self.ai_view.setFixedHeight(180)
+        lay.addWidget(self.ai_view)
+
+    # ── Data helpers ──────────────────────────────────────────────────────
+    def _persist(self):
+        save_config({"portfolio": self.data})
+
+    def _positions(self):
+        return aggregate_positions(self.data.get('transactions', []))
+
+    # ── Actions ───────────────────────────────────────────────────────────
+    def _import(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Carica portfolio", "", "Portfolio (*.json *.csv);;JSON (*.json);;CSV (*.csv)")
+        if not path:
+            return
+        try:
+            self.data = parse_portfolio_file(path)
+            self.data.setdefault('transactions', [])
+        except Exception as exc:
+            QMessageBox.warning(self, "Import fallito", f"Non riesco a leggere il file:\n\n{exc}")
+            return
+        self._persist()
+        BUS.status_msg.emit(f"Portfolio caricato: {len(self.data['transactions'])} transazioni")
+        self._refresh_table()
+
+    def _template(self):
+        directory = QFileDialog.getExistingDirectory(self, "Dove salvo i template?")
+        if not directory:
+            return
+        try:
+            jp, cp = write_portfolio_template(directory)
+            QMessageBox.information(
+                self, "Template creati",
+                f"Creati:\n{jp}\n{cp}\n\nCompila uno dei due e caricalo con 'Carica CSV/JSON'.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Errore", f"Non riesco a scrivere i template:\n\n{exc}")
+
+    def _add_manual(self):
+        sym = self.in_sym.text().strip().upper()
+        if not sym:
+            QMessageBox.information(self, "Manca il simbolo", "Inserisci un simbolo (es. AAPL).")
+            return
+        try:
+            qty   = float(self.in_qty.text().strip())
+            price = float(self.in_px.text().strip())
+        except ValueError:
+            QMessageBox.information(self, "Valori non validi", "Quantità e prezzo devono essere numeri.")
+            return
+        self.data.setdefault('transactions', []).append({
+            'date':     self.in_date.text().strip() or datetime.date.today().isoformat(),
+            'symbol':   sym,
+            'type':     self.in_type.currentText(),
+            'quantity': qty,
+            'price':    price,
+        })
+        self._persist()
+        self.in_sym.clear(); self.in_qty.clear(); self.in_px.clear()
+        BUS.status_msg.emit(f"Aggiunto {self.in_type.currentText()} {qty} {sym}")
+        self._refresh_table()
+
+    def _clear(self):
+        if QMessageBox.question(self, "Svuotare il portfolio?",
+                                "Rimuovo tutte le transazioni salvate?") != QMessageBox.StandardButton.Yes:
+            return
+        self.data = {'portfolio_name': '', 'currency': '', 'owner': '', 'transactions': []}
+        self._persist()
+        self._refresh_table()
+
+    def _refresh_table(self):
+        positions = self._positions()
+        self.table.setRowCount(len(positions))
+        if not positions:
+            self.totals_lbl.setText(
+                "Nessun titolo. Premi '📂 Carica CSV/JSON', oppure '📄 Scarica template', "
+                "oppure aggiungi una posizione a mano qui sopra.")
+            return
+        # Fill known columns immediately; prices arrive from the thread.
+        for i, p in enumerate(positions):
+            self.table.setItem(i, 0, QTableWidgetItem(p['symbol']))
+            self.table.setItem(i, 1, QTableWidgetItem(f"{p['qty']:g}"))
+            self.table.setItem(i, 2, QTableWidgetItem(f"{p['avg_cost']:.4f}"))
+            for col in (3, 4, 5, 6, 7):
+                self.table.setItem(i, col, QTableWidgetItem("…"))
+        self.totals_lbl.setText("Carico i prezzi…")
+        if self._price_thread and self._price_thread.isRunning():
+            self._price_thread.terminate()
+        self._price_thread = PortfolioPriceThread(positions)
+        self._price_thread.done.connect(self._on_prices)
+        self._price_thread.start()
+
+    def _on_prices(self, rows):
+        totals = {}  # currency -> [value, pl]
+        for i, r in enumerate(rows):
+            if not r['priced']:
+                for col, txt in ((3, "n/d"), (4, "n/d"), (5, "n/d"), (6, "n/d"), (7, "n/d")):
+                    self.table.setItem(i, col, QTableWidgetItem(txt))
+                continue
+            price = r['price']; qty = r['qty']; avg = r['avg_cost']
+            value = qty * price
+            pl    = (price - avg) * qty
+            plpct = ((price / avg) - 1) * 100 if avg > 0 else 0.0
+            cur   = r['currency'] or "?"
+            self.table.setItem(i, 3, QTableWidgetItem(f"{price:.4f}"))
+            self.table.setItem(i, 4, QTableWidgetItem(f"{value:,.2f}"))
+            pl_item  = QTableWidgetItem(f"{pl:+,.2f}")
+            pct_item = QTableWidgetItem(f"{plpct:+.2f}%")
+            colr = QColor(C['green']) if pl >= 0 else QColor(C['red'])
+            pl_item.setForeground(colr); pct_item.setForeground(colr)
+            self.table.setItem(i, 5, pl_item)
+            self.table.setItem(i, 6, pct_item)
+            self.table.setItem(i, 7, QTableWidgetItem(cur))
+            t = totals.setdefault(cur, [0.0, 0.0])
+            t[0] += value; t[1] += pl
+        if totals:
+            parts = [f"{cur}: valore {v:,.2f} · P/L {pl:+,.2f}" for cur, (v, pl) in sorted(totals.items())]
+            self.totals_lbl.setText("   ·   ".join(parts))
+        else:
+            self.totals_lbl.setText("Nessun titolo prezzabile (tutti n/d).")
+
+    def _row_clicked(self, row, _col):
+        item = self.table.item(row, 0)
+        if not item:
+            return
+        sym = item.text().strip()
+        if sym:
+            BUS.ticker_changed.emit(sym)
+            self.go_chart.emit(sym)
+
+    def _ai_analyze(self):
+        if not LM.connected:
+            self.ai_view.setPlainText("⚠  LM Studio non connesso. Avvia LM Studio e carica un modello, poi riprova.")
+            return
+        rows = self._positions()
+        if not rows:
+            self.ai_view.setPlainText("Portfolio vuoto. Carica o aggiungi titoli prima dell'analisi.")
+            return
+        lines = [f"- {p['symbol']}: {p['qty']:g} unità, costo medio {p['avg_cost']:.2f}" for p in rows]
+        prompt = (
+            "Analizza questo portfolio retail. Per favore commenta in italiano: "
+            "concentrazione/diversificazione, principali rischi, bilanciamento per settore/area, "
+            "e 2-3 spunti pratici. Non dare consigli finanziari personalizzati, resta educativo.\n\n"
+            "POSIZIONI:\n" + "\n".join(lines)
+        )
+        self._ai = stream_into(
+            self.ai_view, [{"role": "user", "content": prompt}],
+            system="Sei un analista finanziario che spiega in modo chiaro e didattico, in italiano.",
+            max_tokens=1500,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ═══════════════════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
@@ -8778,7 +9133,10 @@ class MainWindow(QMainWindow):
         self.screener = ScreenerPanel()
         self.settings = SettingsPanel()
         self.ai_trader = AITraderPanel()
-        
+        self.portfolio = PortfolioPanel()
+        # Clicking a holding loads it in the chart and switches to the CHART tab
+        self.portfolio.go_chart.connect(lambda _sym: self.tabs.setCurrentWidget(self.chart))
+
         # 👇 1. Instantiate the Insider Panel 👇
         self.insider_pnl = InsiderPanel()
 
@@ -8792,6 +9150,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.insider_pnl, "👔  INSIDER")
         
         self.tabs.addTab(self.screener, "🔍  SCREENER")
+        self.tabs.addTab(self.portfolio,"💼  PORTFOLIO")
         self.tabs.addTab(self.ai_trader,"🤖  AI TRADER")
         self.tabs.addTab(self.settings, "⚙  SETTINGS")
 
