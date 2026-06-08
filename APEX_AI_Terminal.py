@@ -144,7 +144,10 @@ else:  # PySide2
 # ═══════════════════════════════════════════════════════════════════════════════
 APP      = "APEX AI TERMINAL"
 VER      = "v1.0"
-LM_URL   = "http://localhost:1234"
+# LM endpoint is configurable via the APEX_LM_URL environment variable so the app
+# can target LM Studio (default), Ollama (http://localhost:11434), or any other
+# OpenAI-compatible server without editing source.
+LM_URL   = os.environ.get("APEX_LM_URL", "http://localhost:1234")
 
 WATCHLIST_DEFAULT = [
     "AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA",
@@ -829,28 +832,52 @@ LM = LMClient()
 # DATA ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 class DataEngine:
-    """yfinance wrapper with 5-minute result cache."""
+    """yfinance wrapper with a thread-safe, bounded 5-minute result cache."""
+
+    _CACHE_TTL  = 300   # seconds a cached frame stays fresh
+    _CACHE_MAX  = 128   # hard cap on cached entries to bound memory
+
     def __init__(self):
         self._cache = {}
+        # Many QThreads (FetchThread, WatchlistThread, StreamThread, ...) hit this
+        # cache concurrently. Guard all access with a lock to avoid races.
+        self._cache_lock = threading.Lock()
 
     def fetch(self, ticker, period='1y', interval='1d'):
         key = f"{ticker}|{period}|{interval}"
-        if key in self._cache:
-            ts, df = self._cache[key]
-            if time.time() - ts < 300:
-                return df
+        with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                ts, df = cached
+                if time.time() - ts < self._CACHE_TTL:
+                    return df
         try:
             df = yf.Ticker(ticker).history(period=period, interval=interval)
             if df.empty:
                 return None
             df.index = pd.to_datetime(df.index)
-            
-            df.attrs['ticker'] = ticker 
-            self._cache[key] = (time.time(), df)
+
+            df.attrs['ticker'] = ticker
+            with self._cache_lock:
+                self._cache[key] = (time.time(), df)
+                self._evict_locked()
             return df
         except Exception as exc:
             print(f"DataEngine.fetch error [{ticker}]: {exc}")
             return None
+
+    def _evict_locked(self):
+        """Drop expired entries, then trim to _CACHE_MAX oldest-first.
+        Caller must hold self._cache_lock."""
+        now = time.time()
+        expired = [k for k, (ts, _) in self._cache.items()
+                   if now - ts >= self._CACHE_TTL]
+        for k in expired:
+            del self._cache[k]
+        if len(self._cache) > self._CACHE_MAX:
+            for k, _ in sorted(self._cache.items(), key=lambda kv: kv[1][0]
+                               )[:len(self._cache) - self._CACHE_MAX]:
+                del self._cache[k]
 
     def info(self, ticker):
         try:
