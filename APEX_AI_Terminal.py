@@ -58,7 +58,7 @@ try:
     import xgboost as xgb
     from sklearn.model_selection import train_test_split
     from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, ExpSineSquared, WhiteKernel
+    from sklearn.gaussian_process.kernels import RBF, ExpSineSquared, WhiteKernel
     HAS_XGB = True
 except ImportError:
     HAS_XGB = False
@@ -8092,17 +8092,6 @@ class SettingsPanel(QWidget):
                 f'pip install yfinance pdfplumber feedparser xgboost scikit-learn statsmodels</span>'
             ))
         lay.addWidget(dep_grp)
-        # 👇 Add XGBoost to this list 👇
-        for name, ok in[("yfinance", HAS_YF), ("pdfplumber", HAS_PDF), ("feedparser", HAS_FEED), ("xgboost & sklearn", HAS_XGB)]:
-            icon = "✓" if ok else "✗"
-            clr  = C['green'] if ok else C['red']
-            dep_lay.addWidget(QLabel(f'<span style="color:{clr};">{icon}</span>  {name}'))
-        if not (HAS_YF and HAS_PDF and HAS_FEED):
-            dep_lay.addWidget(QLabel(
-                f'<span style="color:{C["text2"]}; font-size:10px;">'
-                f'pip install yfinance pdfplumber feedparser</span>'
-            ))
-        lay.addWidget(dep_grp)
 
         # About
         ab_grp = QGroupBox("ABOUT")
@@ -8112,7 +8101,7 @@ class SettingsPanel(QWidget):
         for line in [
             f"<b style='color:{C['accent']};'>{APP} {VER}</b>",
             "Bloomberg-Style AI Financial Analysis Platform",
-            f"<span style='color:{C['text2']};'>UI: PyQt5 &nbsp;·&nbsp; Charts: Matplotlib &nbsp;·&nbsp; Data: yfinance &nbsp;·&nbsp; AI: LM Studio</span>",
+            f"<span style='color:{C['text2']};'>UI: PyQt6 &nbsp;·&nbsp; Charts: Matplotlib &nbsp;·&nbsp; Data: yfinance &nbsp;·&nbsp; AI: LM Studio</span>",
         ]:
             lbl = QLabel(line)
             ab_lay.addWidget(lbl)
@@ -8151,6 +8140,12 @@ class SettingsPanel(QWidget):
             self.conn_lbl.setStyleSheet(f"color:{C['red']};")
 
     def _save(self):
+        # Apply the server URL the user typed (previously this button did nothing —
+        # only "Test Connection" updated LM.base).
+        new_url = self.url_inp.text().strip()
+        if new_url:
+            LM.base = new_url
+        LM.check()
         BUS.status_msg.emit("Settings applied")
 
 
